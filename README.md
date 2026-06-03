@@ -1,46 +1,71 @@
 # streamx-deploy
-### Deploy StreamX addons to any platform — free
+### Deploy StreamX/Stremio addons anywhere — one bash script, zero dependencies
 
+```bash
+curl -sSL https://aeoncorex-lab.github.io/streamx-deploy/install.sh | bash
 ```
-npm install -g streamx-deploy
-streamx-deploy init
-streamx-deploy deploy
+
+---
+
+## Why bash?
+
+- Works on **every** Unix/Linux/macOS/WSL system out of the box
+- No Node.js, Python, or runtime installation needed
+- Single file — download once, run forever
+- Tested on: Ubuntu, Debian, Alpine, Arch, macOS, Android Termux, Raspberry Pi
+
+---
+
+## Install
+
+```bash
+# One-line install (recommended)
+curl -sSL https://aeoncorex-lab.github.io/streamx-deploy/install.sh | bash
+
+# Manual install
+curl -sSL https://aeoncorex-lab.github.io/streamx-deploy/streamx-deploy \
+  -o /usr/local/bin/streamx-deploy
+chmod +x /usr/local/bin/streamx-deploy
+
+# Windows (WSL / Git Bash)
+curl -sSL https://aeoncorex-lab.github.io/streamx-deploy/streamx-deploy \
+  -o ~/bin/streamx-deploy
+chmod +x ~/bin/streamx-deploy
 ```
 
 ---
 
 ## Supported Platforms
 
-| Platform | Cost | Deploy Time | Always-On | HTTPS |
-|----------|------|-------------|-----------|-------|
-| **Cloudflare Workers** | Free (100k req/day) | 30s | ✅ | ✅ Auto |
-| **Vercel** | Free (100GB/month) | 1min | ✅ | ✅ Auto |
-| **Render** | Free (sleeps 15min) | 2min | ⚠️ | ✅ Auto |
-| **Railway** | $5 credit/month | 2min | ✅ | ✅ Auto |
-| **Docker/VPS** | Your server cost | 5min | ✅ | Manual Caddy |
+| Platform | Cost | Always-on | HTTPS | CLI |
+|----------|------|-----------|-------|-----|
+| **Cloudflare Workers** | Free (100k req/day) | ✅ | ✅ auto | `wrangler` |
+| **Vercel** | Free (100GB/mo) | ✅ | ✅ auto | `vercel` |
+| **Netlify Functions** | Free (125k req/mo) | ✅ | ✅ auto | `netlify` |
+| **Render** | Free (sleeps 15min) | ⚠️ | ✅ auto | git push |
+| **Fly.io** | Free tier | ✅ | ✅ auto | `flyctl` |
+| **Railway** | $5 credit/month | ✅ | ✅ auto | `railway` |
+| **Docker / VPS** | Your server | ✅ | Manual Caddy | `docker` + `ssh` |
+| **Cherry Servers** | Your server | ✅ | Manual Caddy | `docker` + `ssh` |
+| **Any VPS (SSH)** | Your server | ✅ | Manual Caddy | `docker` + `ssh` |
 
-**Recommended:**
-- Low traffic addon → **Cloudflare Workers** (fastest + free)
-- Node.js addon, always-on free → **Vercel**
-- Full control, power user → **Docker/VPS**
+**Recommendation:** Cloudflare Workers for most addons — genuinely free, global CDN, zero cold starts.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Install globally
-npm install -g streamx-deploy
-
-# 1. Create new addon project
-streamx-deploy init
-# → prompts: name, addon ID, platform choice
+# 1. Create addon project (interactive)
+streamx-deploy new
+#  → prompts: name, addon ID, target platform
+#  → generates: src/index.js, manifest.json, platform config, GitHub Actions
 
 # 2. Edit your logic
 cd my-addon
-# → edit src/index.js → fill in getStreams() function
+# Edit src/index.js → fill in getStreams() function
 
-# 3. Test locally
+# 3. Test locally (needs Node.js, Bun, or Deno)
 streamx-deploy test
 
 # 4. Deploy
@@ -49,8 +74,8 @@ streamx-deploy deploy
 # 5. Validate live endpoint
 streamx-deploy validate https://my-addon.workers.dev/manifest.json
 
-# 6. Submit to StreamX community registry
-streamx-deploy publish
+# 6. Register to StreamX community catalog
+streamx-deploy register
 ```
 
 ---
@@ -58,127 +83,68 @@ streamx-deploy publish
 ## Commands
 
 ```
-streamx-deploy init                    scaffold new addon project
-streamx-deploy deploy                  deploy (interactive platform choice)
-streamx-deploy deploy -p cloudflare    deploy to specific platform
-streamx-deploy test                    test endpoints locally
-streamx-deploy test -p 8080 -i tt0068646
-streamx-deploy validate [url]          validate a live addon
-streamx-deploy publish                 submit to registry
-streamx-deploy logs                    tail platform logs
-streamx-deploy info                    show current project config
+streamx-deploy new              Scaffold new addon project
+streamx-deploy deploy           Deploy (uses platform from .streamx-deploy.json)
+streamx-deploy deploy -p cf     Force platform: cf|cloudflare|vercel|render|railway|
+                                                  netlify|fly|docker|vps
+streamx-deploy test             Test local endpoints (port 7070)
+streamx-deploy test 8080        Test on custom port
+streamx-deploy validate <url>   Validate a live addon manifest URL
+streamx-deploy register         Submit to StreamX community registry
+streamx-deploy platforms        Show all platforms + installation status
+streamx-deploy update           Update streamx-deploy to latest version
+streamx-deploy version          Show version
 ```
 
 ---
 
-## Platform-Specific Setup
-
-### Cloudflare Workers
-```bash
-npm install -g wrangler
-wrangler login
-# → edit wrangler.toml: set name and [vars]
-streamx-deploy deploy -p cloudflare
-```
-**GitHub auto-deploy secrets needed:**
-- `CF_API_TOKEN` — Cloudflare API token (Workers:Edit)
-- `CF_ACCOUNT_ID` — Your Cloudflare account ID
-
-### Vercel
-```bash
-npm install -g vercel
-vercel login
-streamx-deploy deploy -p vercel
-```
-**GitHub auto-deploy secrets needed:**
-- `VERCEL_TOKEN`
-- `VERCEL_ORG_ID`
-- `VERCEL_PROJECT_ID`
-
-### Render
-Render deploys automatically when you push to GitHub:
-1. Create account at render.com
-2. New Web Service → Connect GitHub repo
-3. Build command: `npm install`
-4. Start command: `node src/index.js`
-5. Add env vars in Render dashboard
-
-**GitHub auto-deploy secrets needed:**
-- `RENDER_DEPLOY_HOOK_URL` — From Render service → Settings → Deploy Hook
-
-### Railway
-```bash
-npm install -g @railway/cli
-railway login
-railway init
-streamx-deploy deploy -p railway
-```
-**GitHub auto-deploy secrets needed:**
-- `RAILWAY_TOKEN`
-- `RAILWAY_SERVICE_ID`
-
-### Docker / VPS
-```bash
-# Build image
-streamx-deploy deploy -p docker
-
-# Push to Docker Hub
-docker tag streamx-addon:latest YOUR_USER/streamx-addon:latest
-docker push YOUR_USER/streamx-addon:latest
-
-# On your VPS
-docker compose up -d
-```
-**GitHub auto-deploy secrets needed:**
-- `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`
-- `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`
-
----
-
-## Project Structure
-
-After `streamx-deploy init`, your project looks like:
+## Project structure (after `streamx-deploy new`)
 
 ```
 my-addon/
 ├── src/
-│   └── index.js          ← YOUR LOGIC HERE (edit getStreams())
+│   └── index.js              ← YOUR LOGIC (edit getStreams())
+├── manifest.json             ← addon metadata
 ├── package.json
-├── manifest.json         ← addon metadata
-├── .streamx-deploy.json  ← deployment config (auto-generated)
-├── .env.example          ← API keys template
-├── wrangler.toml         ← (cloudflare only)
-├── vercel.json           ← (vercel only)
-├── Dockerfile            ← (docker only)
-├── docker-compose.yml    ← (docker only)
+├── .streamx-deploy.json      ← deployment config (auto-managed)
+├── .env.example              ← API key template
+├── .gitignore
+│
+├── wrangler.toml             ← (Cloudflare only)
+├── vercel.json               ← (Vercel only)
+├── netlify.toml              ← (Netlify only)
+├── fly.toml                  ← (Fly.io only)
+├── Dockerfile                ← (Docker/VPS only)
+├── docker-compose.yml        ← (Docker/VPS only)
+├── Caddyfile                 ← (VPS HTTPS template)
+│
 └── .github/
     └── workflows/
-        └── deploy.yml    ← auto-deploy on git push
+        └── deploy.yml        ← auto-deploy on git push
 ```
 
 ---
 
-## getStreams() Reference
+## getStreams() API
 
 ```js
-// movie  → type='movie',  imdbId='tt1234567', season=undefined, episode=undefined
-// series → type='series', imdbId='tt1234567', season='1',       episode='3'
-async function getStreams(type, imdbId, season, episode, env) {
+// Called for each stream request
+// type    = 'movie' | 'series'
+// imdbId  = 'tt1234567'
+// season  = '1'    (series only, undefined for movies)
+// episode = '3'    (series only)
+async function getStreams(type, imdbId, season, episode) {
   return [
     {
-      url:         'https://...',          // required: direct video URL
-      name:        '1080p',               // shown in StreamX source list
-      description: 'MySite | FHD',        // subtitle under name
-      // optional:
+      url:         'https://...',       // required: direct video URL
+      name:        '1080p FHD',         // shown in StreamX source list
+      description: 'MySite | Server1',  // subtitle under name
+      // optional fields:
+      subtitles: [{ url: 'https://...sub.srt', lang: 'en' }],
       behaviorHints: {
-        notWebReady: true,               // set if URL needs auth headers
-        proxyHeaders: {
-          request: { 'Referer': 'https://mysite.xyz' }
-        }
-      },
-      subtitles: [                       // optional: embedded subtitles
-        { url: 'https://...sub.srt', lang: 'en' }
-      ]
+        notWebReady: true,
+        proxyHeaders: { request: { 'Referer': 'https://mysite.xyz' } }
+      }
     }
   ]
 }
@@ -186,22 +152,103 @@ async function getStreams(type, imdbId, season, episode, env) {
 
 ---
 
-## Deploying addon to multiple platforms
+## Platform-specific setup
 
-You can deploy the same addon to multiple platforms:
-
+### Cloudflare Workers
 ```bash
-streamx-deploy deploy -p cloudflare   # primary
-streamx-deploy deploy -p vercel       # backup
+npm install -g wrangler
+wrangler login
+# GitHub Actions secrets: CF_API_TOKEN, CF_ACCOUNT_ID
 ```
 
-Use the same manifest ID — StreamX registry stores one URL per addon.
-Publish the most reliable one (usually Cloudflare Workers).
+### Vercel
+```bash
+npm install -g vercel
+vercel login
+# GitHub Actions secrets: VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID
+```
+
+### Render
+Connect GitHub repo at render.com → New Web Service. Auto-deploys on push.
+```bash
+# GitHub Actions secrets: RENDER_DEPLOY_HOOK
+```
+
+### Railway
+```bash
+npm install -g @railway/cli
+railway login && railway init
+# GitHub Actions secrets: RAILWAY_TOKEN, RAILWAY_SERVICE
+```
+
+### Netlify
+```bash
+npm install -g netlify-cli
+netlify login
+```
+
+### Fly.io
+```bash
+curl -L https://fly.io/install.sh | sh
+flyctl auth login && flyctl launch
+# GitHub Actions secrets: FLY_API_TOKEN
+```
+
+### Docker / VPS / Cherry Servers
+```bash
+# Install Docker on your server:
+curl -fsSL https://get.docker.com | sh
+
+# Clone and run:
+git clone https://github.com/YOUR_USER/my-addon
+cd my-addon
+docker compose up -d
+
+# For HTTPS, add Caddy:
+docker compose -f docker-compose.yml -f docker-compose.caddy.yml up -d
+# GitHub Actions secrets: DOCKERHUB_USER, DOCKERHUB_TOKEN, VPS_HOST, VPS_USER, VPS_SSH_KEY
+```
 
 ---
 
-## Note on hosting costs
+## Environment variables / API keys
 
-**You are responsible for your hosting.** StreamX provides this tool free.
-All listed platforms have free tiers sufficient for most addons.
-Cloudflare Workers is recommended — genuinely free with no credit card.
+```bash
+# Cloudflare Workers (never in code)
+wrangler secret put MY_API_KEY
+
+# Vercel
+vercel env add MY_API_KEY
+
+# Railway
+railway variables set MY_API_KEY=value
+
+# Render
+# Set in Render dashboard → Environment
+
+# Docker/VPS — use .env file (never commit)
+echo "MY_API_KEY=value" >> .env
+```
+
+---
+
+## Registry submission rules
+
+To get listed in the StreamX addon catalog:
+
+1. Addon must respond 24/7 — **health-checked every 6 hours**
+2. `/manifest.json` must return valid JSON with required fields
+3. `/stream/{type}/{id}.json` must return `{ streams: [] }`
+4. ID must follow format: `community.authorname.addonname`
+5. Must use **HTTPS** (not HTTP)
+6. NSFW content: set `"nsfw": true` in flags
+7. **3 consecutive health failures → auto-removed** from catalog
+
+After merge: your addon appears on the catalog website immediately.
+
+---
+
+## Stremio compatibility
+
+Your addon is **fully Stremio-compatible**. The protocol is identical.
+Users can install it in both StreamX and Stremio using the same URL.

@@ -1,0 +1,1101 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════════════════
+#  streamx-deploy  v2.0
+#  Ultimate StreamX / Stremio addon deploy tool
+#
+#  Install:
+#    curl -sSL https://aeoncorex-lab.github.io/streamx-deploy/install.sh | bash
+#
+#  Or manually:
+#    curl -sSL https://aeoncorex-lab.github.io/streamx-deploy/streamx-deploy -o streamx-deploy
+#    chmod +x streamx-deploy && sudo mv streamx-deploy /usr/local/bin/
+#
+#  Commands:
+#    streamx-deploy new              → scaffold addon project (interactive)
+#    streamx-deploy deploy           → deploy to any platform (interactive)
+#    streamx-deploy test             → test endpoints locally
+#    streamx-deploy validate <url>   → validate live addon
+#    streamx-deploy register         → submit to StreamX registry
+#    streamx-deploy platforms        → show all supported platforms
+#    streamx-deploy update           → update this tool
+# ═══════════════════════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+VERSION="2.0.0"
+REGISTRY_REPO="https://github.com/YOUR_GITHUB_USERNAME/streamx-addons"
+REGISTRY_API="https://aeoncorex-lab.github.io/streamx-addons/registry.json"
+TEMPLATE_BASE="https://aeoncorex-lab.github.io/streamx-deploy/templates"
+DEPLOY_CFG=".streamx-deploy.json"
+
+# ── Colours ────────────────────────────────────────────────────────────────────
+R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m'
+B='\033[0;34m' C='\033[0;36m' M='\033[0;35m'
+W='\033[1;37m' DIM='\033[2m'  NC='\033[0m'
+BOLD='\033[1m'
+
+ok()   { echo -e "${G}✓${NC}  $*"; }
+err()  { echo -e "${R}✗${NC}  $*" >&2; }
+warn() { echo -e "${Y}⚠${NC}  $*"; }
+info() { echo -e "${C}›${NC}  $*"; }
+step() { echo -e "\n${BOLD}${W}$*${NC}"; }
+dim()  { echo -e "${DIM}$*${NC}"; }
+
+# ── Banner ─────────────────────────────────────────────────────────────────────
+banner() {
+  echo -e "${C}"
+  cat << 'EOF'
+  ╔══════════════════════════════════════════════════╗
+  ║   StreamX Deploy  —  Addon Deploy Tool v2.0      ║
+  ║   Deploy anywhere. Register once. Run forever.   ║
+  ╚══════════════════════════════════════════════════╝
+EOF
+  echo -e "${NC}"
+}
+
+# ── Dependency check ───────────────────────────────────────────────────────────
+has() { command -v "$1" &>/dev/null; }
+
+require_any() {
+  # At least one of: node, bun, deno
+  has node || has bun || has deno || {
+    err "No JavaScript runtime found. Install Node.js, Bun, or Deno."
+    echo "  Node.js: https://nodejs.org"
+    echo "  Bun:     curl -fsSL https://bun.sh/install | bash"
+    exit 1
+  }
+}
+
+js_runner() {
+  if   has bun;  then echo "bun"
+  elif has node; then echo "node"
+  elif has deno; then echo "deno run --allow-all"
+  fi
+}
+
+# ── JSON helpers (pure bash, no jq needed) ────────────────────────────────────
+json_get() {
+  # json_get <file> <key>  — simple key extraction without jq
+  local file="$1" key="$2"
+  grep -o "\"${key}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$file" 2>/dev/null \
+    | head -1 | sed 's/.*":\s*"\(.*\)"/\1/'
+}
+
+json_set() {
+  # Update a key in a JSON file using python (available everywhere)
+  local file="$1" key="$2" val="$3"
+  python3 -c "
+import json, sys
+with open('$file') as f: d = json.load(f)
+d['$key'] = '$val'
+with open('$file', 'w') as f: json.dump(d, f, indent=2)
+" 2>/dev/null || true
+}
+
+# ── Platform detection ─────────────────────────────────────────────────────────
+detect_platforms() {
+  local avail=()
+  has wrangler        && avail+=("cloudflare")
+  has vercel          && avail+=("vercel")
+  has railway         && avail+=("railway")
+  has netlify         && avail+=("netlify")
+  has flyctl          && avail+=("fly")
+  has docker          && avail+=("docker")
+  has ssh             && avail+=("vps")
+  echo "${avail[@]:-none}"
+}
+
+# ── Interactive prompt ─────────────────────────────────────────────────────────
+prompt() {
+  local msg="$1" default="${2:-}" var
+  if [[ -n "$default" ]]; then
+    echo -ne "${W}${msg}${NC} ${DIM}[${default}]${NC}: "
+  else
+    echo -ne "${W}${msg}${NC}: "
+  fi
+  read -r var
+  echo "${var:-$default}"
+}
+
+prompt_select() {
+  local msg="$1"; shift
+  local opts=("$@")
+  echo -e "\n${W}${msg}${NC}"
+  for i in "${!opts[@]}"; do
+    echo -e "  ${C}$((i+1))${NC}. ${opts[$i]}"
+  done
+  echo -ne "\n${W}Choice${NC} [1]: "
+  local choice; read -r choice
+  choice="${choice:-1}"
+  echo "${opts[$((choice-1))]}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  COMMAND: new
+#  Scaffold a new addon project from template
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_new() {
+  banner
+  step "Create New StreamX Addon"
+
+  local name id display_name desc platform
+
+  name=$(prompt "Project directory name (lowercase, hyphens)" "my-addon")
+  id=$(prompt "Addon ID (community.author.name format)" "community.myname.${name}")
+  display_name=$(prompt "Display name" "${name^}")
+  desc=$(prompt "Short description" "StreamX community addon")
+
+  # Platform choice
+  platform=$(prompt_select "Target platform:" \
+    "☁️  Cloudflare Workers  (free, global CDN, recommended)" \
+    "▲  Vercel              (free, serverless)" \
+    "⚙️  Render              (free tier, may sleep)" \
+    "🚂 Railway             (\$5 free credit/month)" \
+    "🌐 Netlify Functions   (free tier)" \
+    "✈️  Fly.io              (free tier)" \
+    "🐳 Docker / VPS        (self-hosted, full control)" \
+    "🍒 Cherry Servers      (dedicated server, SSH+Docker)"
+  )
+
+  # Map display to key
+  case "$platform" in
+    *Cloudflare*) PLAT="cloudflare" ;;
+    *Vercel*)     PLAT="vercel"     ;;
+    *Render*)     PLAT="render"     ;;
+    *Railway*)    PLAT="railway"    ;;
+    *Netlify*)    PLAT="netlify"    ;;
+    *Fly*)        PLAT="fly"        ;;
+    *Cherry*)     PLAT="vps"        ;;
+    *)            PLAT="docker"     ;;
+  esac
+
+  [[ -d "$name" ]] && { err "Directory '$name' already exists"; exit 1; }
+  mkdir -p "$name/src"
+  cd "$name"
+
+  step "Generating project files…"
+
+  # ── manifest.json ─────────────────────────────────────────────────────────
+  cat > manifest.json << EOF
+{
+  "id":          "${id}",
+  "version":     "1.0.0",
+  "name":        "${display_name}",
+  "description": "${desc}",
+  "logo":        "",
+  "types":       ["movie", "series"],
+  "resources":   ["stream"],
+  "idPrefixes":  ["tt"],
+  "catalogs":    []
+}
+EOF
+
+  # ── package.json ──────────────────────────────────────────────────────────
+  cat > package.json << EOF
+{
+  "name": "${name}",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start":    "node src/index.js",
+    "dev":      "node --watch src/index.js",
+    "test":     "streamx-deploy test",
+    "deploy":   "streamx-deploy deploy",
+    "register": "streamx-deploy register"
+  },
+  "dependencies": { "cors": "^2.8.5", "express": "^4.19.2" },
+  "engines": { "node": ">=18" }
+}
+EOF
+
+  # ── .streamx-deploy.json ──────────────────────────────────────────────────
+  cat > .streamx-deploy.json << EOF
+{
+  "addonId":     "${id}",
+  "addonName":   "${display_name}",
+  "addonDesc":   "${desc}",
+  "platform":    "${PLAT}",
+  "createdAt":   "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+
+  # ── .env.example ──────────────────────────────────────────────────────────
+  cat > .env.example << 'EOF'
+# Add your API keys here (never commit .env)
+# ADDON_ID=community.myname.myaddon
+# MY_API_KEY=
+EOF
+
+  # ── .gitignore ────────────────────────────────────────────────────────────
+  cat > .gitignore << 'EOF'
+node_modules/
+.env
+.wrangler/
+.vercel/
+dist/
+*.log
+EOF
+
+  # ── src/index.js ──────────────────────────────────────────────────────────
+  _write_addon_template "$PLAT" "$id" "$display_name" "$desc"
+
+  # ── Platform-specific files ────────────────────────────────────────────────
+  _write_platform_config "$PLAT" "$name" "$id" "$display_name"
+
+  # ── GitHub Actions ────────────────────────────────────────────────────────
+  mkdir -p .github/workflows
+  _write_github_action "$PLAT"
+
+  ok "Project created: ${W}${name}/${NC}"
+  echo
+  echo -e "${BOLD}Next steps:${NC}"
+  echo -e "  ${C}cd ${name}${NC}"
+  echo -e "  ${C}npm install${NC}"
+  echo -e "  ${Y}# Edit src/index.js → fill in getStreams()${NC}"
+  echo -e "  ${C}streamx-deploy test${NC}        ${DIM}# test locally${NC}"
+  echo -e "  ${C}streamx-deploy deploy${NC}      ${DIM}# deploy to ${PLAT}${NC}"
+  echo -e "  ${C}streamx-deploy register${NC}    ${DIM}# submit to StreamX registry${NC}"
+  echo
+  _print_platform_setup "$PLAT"
+}
+
+# ── Write addon template ───────────────────────────────────────────────────────
+_write_addon_template() {
+  local plat="$1" id="$2" name="$3" desc="$4"
+
+  if [[ "$plat" == "cloudflare" ]]; then
+    # Cloudflare Workers (no Express, fetch API)
+    cat > src/index.js << 'JSEOF'
+// StreamX Addon — Cloudflare Workers template
+// Edit getStreams() with your scraping logic
+
+export default {
+  async fetch(req, env) {
+    const url  = new URL(req.url)
+    const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,HEAD,OPTIONS' }
+
+    if (req.method === 'OPTIONS') return new Response(null, { headers: cors })
+
+    const manifest = {
+      id:          env.ADDON_ID      ?? 'ADDON_ID_PLACEHOLDER',
+      version:     env.ADDON_VERSION ?? '1.0.0',
+      name:        env.ADDON_NAME    ?? 'ADDON_NAME_PLACEHOLDER',
+      description: env.ADDON_DESC   ?? 'ADDON_DESC_PLACEHOLDER',
+      types:       ['movie','series'],
+      resources:   ['stream'],
+      idPrefixes:  ['tt'],
+      catalogs:    [],
+    }
+
+    if (url.pathname === '/manifest.json') return json(manifest, cors)
+    if (url.pathname === '/health') return json({ status:'ok' }, cors)
+
+    const m = url.pathname.match(/^\/stream\/([^/]+)\/(.+)\.json$/)
+    if (m) {
+      const [,type,rawId] = m
+      const [imdbId,season,episode] = decodeURIComponent(rawId).split(':')
+      const streams = await getStreams(type, imdbId, season, episode, env)
+      return json({ streams }, cors)
+    }
+
+    return new Response('Not Found', { status: 404, headers: cors })
+  }
+}
+
+async function getStreams(type, imdbId, season, episode, env) {
+  // !! EDIT THIS with your scraping/API logic !!
+  // env.MY_API_KEY  ← set with: wrangler secret put MY_API_KEY
+  //
+  // Example:
+  // const r = await fetch(`https://mysite.xyz/api?id=${imdbId}`)
+  // const d = await r.json()
+  // return d.links.map(l => ({ url: l.url, name: l.quality, description: l.server }))
+  return []
+}
+
+function json(d, h={}) {
+  return new Response(JSON.stringify(d), { headers: { 'Content-Type':'application/json', ...h } })
+}
+JSEOF
+  else
+    # Express template (Vercel, Render, Railway, Netlify, VPS, Docker, Fly)
+    cat > src/index.js << 'JSEOF'
+// StreamX Addon — Express template
+// Works on: Vercel, Render, Railway, Netlify, VPS, Docker, Fly.io
+// Edit getStreams() with your scraping logic
+
+import express from 'express'
+import cors    from 'cors'
+
+export const app  = express()
+const port = parseInt(process.env.PORT ?? '7000')
+
+app.use(cors())
+app.use(express.json())
+
+const MANIFEST = {
+  id:          process.env.ADDON_ID      ?? 'ADDON_ID_PLACEHOLDER',
+  version:     process.env.ADDON_VERSION ?? '1.0.0',
+  name:        process.env.ADDON_NAME    ?? 'ADDON_NAME_PLACEHOLDER',
+  description: process.env.ADDON_DESC   ?? 'ADDON_DESC_PLACEHOLDER',
+  types:       ['movie', 'series'],
+  resources:   ['stream'],
+  idPrefixes:  ['tt'],
+  catalogs:    [],
+}
+
+app.get('/manifest.json', (_, res) => res.json(MANIFEST))
+app.get('/health',        (_, res) => res.json({ status: 'ok', version: MANIFEST.version }))
+
+// ── STREAM ENDPOINT ─────────────────────────────────────────────────────────
+// id format: "tt1234567" (movie) or "tt1234567:1:3" (series S01E03)
+app.get('/stream/:type/:id.json', async (req, res) => {
+  const { type } = req.params
+  const [imdbId, season, episode] = decodeURIComponent(req.params.id).split(':')
+  try {
+    const streams = await getStreams(type, imdbId, season, episode)
+    res.json({ streams })
+  } catch(e) {
+    console.error('[stream]', e.message)
+    res.json({ streams: [] })
+  }
+})
+
+// ── SUBTITLE ENDPOINT (optional) ────────────────────────────────────────────
+// Remove if you don't need subtitles (also remove from MANIFEST.resources)
+app.get('/subtitles/:type/:id.json', async (req, res) => {
+  const [imdbId] = decodeURIComponent(req.params.id).split(':')
+  res.json({ subtitles: [] }) // implement if needed
+})
+
+// ── HOME PAGE ────────────────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  const url = `${req.protocol}://${req.get('host')}/manifest.json`
+  res.send(`<!DOCTYPE html><html><head><title>${MANIFEST.name}</title>
+<style>body{font-family:sans-serif;max-width:560px;margin:60px auto;background:#06060f;color:#fff;padding:24px}
+h1{color:#82b1ff}pre{background:#0e0e18;padding:14px;border-radius:8px;overflow-x:auto;font-size:13px}
+.btn{display:inline-block;margin-top:12px;padding:12px 22px;background:#1a3a1a;color:#81c784;
+border:1px solid #4caf50;border-radius:8px;text-decoration:none;font-weight:700}</style></head>
+<body><h1>${MANIFEST.name}</h1><p>${MANIFEST.description}</p>
+<pre>${url}</pre>
+<a class="btn" href="streamx://install-addon?url=${encodeURIComponent(url)}">➕ Install in StreamX</a>
+</body></html>`)
+})
+
+// ──────────────────────────────────────────────────────────────────────────────
+//  YOUR LOGIC — edit this function
+// ──────────────────────────────────────────────────────────────────────────────
+async function getStreams(type, imdbId, season, episode) {
+  // !! REPLACE WITH YOUR SCRAPING / API LOGIC !!
+  //
+  // Return array of stream objects:
+  //   { url, name, description, subtitles?, behaviorHints? }
+  //
+  // Examples:
+  //   const r = await fetch(`https://mysite.xyz/api?imdb=${imdbId}`)
+  //   const d = await r.json()
+  //   return d.streams.map(s => ({ url: s.link, name: s.quality, description: s.server }))
+  return []
+}
+
+// Start server (skip for Vercel serverless)
+if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`\n🚀 ${MANIFEST.name} on port ${port}`)
+    console.log(`   Manifest: http://127.0.0.1:${port}/manifest.json\n`)
+  })
+}
+
+export default app // for Vercel
+JSEOF
+  fi
+
+  # Patch placeholder values
+  sed -i "s|ADDON_ID_PLACEHOLDER|${id}|g"     src/index.js 2>/dev/null || \
+    sed -i '' "s|ADDON_ID_PLACEHOLDER|${id}|g" src/index.js
+  sed -i "s|ADDON_NAME_PLACEHOLDER|${name}|g"  src/index.js 2>/dev/null || \
+    sed -i '' "s|ADDON_NAME_PLACEHOLDER|${name}|g" src/index.js
+  sed -i "s|ADDON_DESC_PLACEHOLDER|${desc}|g"  src/index.js 2>/dev/null || \
+    sed -i '' "s|ADDON_DESC_PLACEHOLDER|${desc}|g" src/index.js
+}
+
+# ── Write platform config files ────────────────────────────────────────────────
+_write_platform_config() {
+  local plat="$1" name="$2" id="$3" display="$4"
+
+  case "$plat" in
+    cloudflare)
+      cat > wrangler.toml << EOF
+name               = "${name}"
+main               = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+ADDON_ID      = "${id}"
+ADDON_VERSION = "1.0.0"
+ADDON_NAME    = "${display}"
+ADDON_DESC    = "StreamX community addon"
+
+# Secrets (never put in vars):
+# wrangler secret put MY_API_KEY
+
+[env.production]
+name = "${name}-prod"
+EOF
+      ;;
+    vercel)
+      cat > vercel.json << EOF
+{
+  "version": 2,
+  "builds": [{ "src": "src/index.js", "use": "@vercel/node" }],
+  "routes": [{ "src": "/(.*)", "dest": "src/index.js" }],
+  "env": {
+    "ADDON_ID":   "${id}",
+    "ADDON_NAME": "${display}"
+  }
+}
+EOF
+      ;;
+    netlify)
+      mkdir -p netlify/functions
+      cat > netlify.toml << 'EOF'
+[build]
+  command   = "npm install"
+  functions = "netlify/functions"
+
+[[redirects]]
+  from   = "/*"
+  to     = "/.netlify/functions/addon/:splat"
+  status = 200
+EOF
+      # Create Netlify function wrapper
+      cat > netlify/functions/addon.mjs << 'EOF'
+import { app } from '../../src/index.js'
+import serverless from 'serverless-http'
+export const handler = serverless(app)
+EOF
+      ;;
+    fly)
+      cat > fly.toml << EOF
+app = "${name}"
+primary_region = "sin"
+
+[build]
+
+[http_service]
+  internal_port = 7000
+  force_https   = true
+  [[http_service.ports]]
+    port = 443
+
+[env]
+  ADDON_ID   = "${id}"
+  ADDON_NAME = "${display}"
+  PORT       = "7000"
+EOF
+      ;;
+    docker|vps|cherry*)
+      cat > Dockerfile << 'EOF'
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+COPY . .
+EXPOSE 7000
+ENV PORT=7000
+HEALTHCHECK --interval=30s --timeout=10s CMD wget -qO- http://localhost:7000/health || exit 1
+CMD ["node", "src/index.js"]
+EOF
+      cat > docker-compose.yml << EOF
+services:
+  addon:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "7000:7000"
+    environment:
+      - PORT=7000
+      - ADDON_ID=${id}
+      - ADDON_NAME=${display}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+EOF
+      # Caddyfile for HTTPS on VPS
+      cat > Caddyfile << 'EOF'
+# Replace your-domain.com with actual domain
+your-domain.com {
+  reverse_proxy addon:7000
+}
+EOF
+      ;;
+    render)
+      cat > render.yaml << EOF
+services:
+  - type: web
+    name: ${name}
+    env: node
+    buildCommand: npm install
+    startCommand: node src/index.js
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: ADDON_ID
+        value: ${id}
+      - key: ADDON_NAME
+        value: ${display}
+EOF
+      ;;
+    railway)
+      mkdir -p .railway
+      cat > .railway/Procfile << 'EOF'
+web: node src/index.js
+EOF
+      ;;
+  esac
+}
+
+# ── Write GitHub Actions ───────────────────────────────────────────────────────
+_write_github_action() {
+  local plat="$1"
+  case "$plat" in
+    cloudflare)
+      cat > .github/workflows/deploy.yml << 'EOF'
+name: Deploy to Cloudflare Workers
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken:  ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          command:   deploy --env production
+      - name: Verify live
+        run: |
+          sleep 5
+          curl -sf "${WORKER_URL}/manifest.json" && echo "✅ Live" || echo "⚠️ Not responding yet"
+        env:
+          WORKER_URL: ${{ vars.WORKER_URL }}
+EOF
+      ;;
+    vercel)
+      cat > .github/workflows/deploy.yml << 'EOF'
+name: Deploy to Vercel
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: npm ci
+      - run: npx vercel --token=${{ secrets.VERCEL_TOKEN }} --prod --yes
+        env:
+          VERCEL_ORG_ID:     ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+EOF
+      ;;
+    render)
+      cat > .github/workflows/deploy.yml << 'EOF'
+name: Trigger Render Deploy
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger deploy
+        run: curl -fsX POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
+EOF
+      ;;
+    railway)
+      cat > .github/workflows/deploy.yml << 'EOF'
+name: Deploy to Railway
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bervProject/railway-deploy@main
+        with:
+          railway_token: ${{ secrets.RAILWAY_TOKEN }}
+          service:       ${{ secrets.RAILWAY_SERVICE }}
+EOF
+      ;;
+    fly)
+      cat > .github/workflows/deploy.yml << 'EOF'
+name: Deploy to Fly.io
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+EOF
+      ;;
+    docker|vps|cherry*)
+      cat > .github/workflows/deploy.yml << 'EOF'
+name: Deploy to VPS via Docker
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USER }}/streamx-addon:latest
+      - uses: appleboy/ssh-action@v1
+        with:
+          host:     ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key:      ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            docker pull ${{ secrets.DOCKERHUB_USER }}/streamx-addon:latest
+            cd /opt/streamx-addon && docker compose up -d --force-recreate
+            echo "✅ Deployed"
+EOF
+      ;;
+    *)
+      cat > .github/workflows/deploy.yml << 'EOF'
+name: Deploy
+on:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: npm ci && npm test
+EOF
+      ;;
+  esac
+}
+
+# ── Platform setup hints ───────────────────────────────────────────────────────
+_print_platform_setup() {
+  local plat="$1"
+  echo -e "${Y}Platform setup (${plat}):${NC}"
+  case "$plat" in
+    cloudflare)
+      echo -e "  ${C}npm install -g wrangler${NC}"
+      echo -e "  ${C}wrangler login${NC}"
+      echo -e "  ${DIM}GitHub secrets needed: CF_API_TOKEN, CF_ACCOUNT_ID${NC}"
+      ;;
+    vercel)
+      echo -e "  ${C}npm install -g vercel${NC}"
+      echo -e "  ${C}vercel login${NC}"
+      echo -e "  ${DIM}GitHub secrets needed: VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID${NC}"
+      ;;
+    render)
+      echo -e "  ${C}Go to render.com → New Web Service → Connect GitHub repo${NC}"
+      echo -e "  ${DIM}GitHub secrets needed: RENDER_DEPLOY_HOOK${NC}"
+      ;;
+    railway)
+      echo -e "  ${C}npm install -g @railway/cli${NC}"
+      echo -e "  ${C}railway login && railway init${NC}"
+      echo -e "  ${DIM}GitHub secrets needed: RAILWAY_TOKEN, RAILWAY_SERVICE${NC}"
+      ;;
+    netlify)
+      echo -e "  ${C}npm install -g netlify-cli${NC}"
+      echo -e "  ${C}netlify login && netlify init${NC}"
+      ;;
+    fly)
+      echo -e "  ${C}curl -L https://fly.io/install.sh | sh${NC}"
+      echo -e "  ${C}flyctl auth login && flyctl launch${NC}"
+      echo -e "  ${DIM}GitHub secrets needed: FLY_API_TOKEN${NC}"
+      ;;
+    docker|vps|cherry*)
+      echo -e "  ${C}Make sure Docker is installed on your server${NC}"
+      echo -e "  ${C}docker compose up -d${NC}"
+      echo -e "  ${DIM}GitHub secrets: DOCKERHUB_USER, DOCKERHUB_TOKEN, VPS_HOST, VPS_USER, VPS_SSH_KEY${NC}"
+      ;;
+  esac
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  COMMAND: deploy
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_deploy() {
+  [[ ! -f "$DEPLOY_CFG" ]] && { err "Not in a streamx-deploy project. Run: streamx-deploy new"; exit 1; }
+
+  local plat
+  plat=$(python3 -c "import json; print(json.load(open('$DEPLOY_CFG')).get('platform',''))" 2>/dev/null || echo "")
+
+  if [[ -z "$plat" ]]; then
+    local choice
+    choice=$(prompt_select "Choose platform:" \
+      "☁️  Cloudflare Workers" "▲  Vercel" "⚙️  Render" "🚂 Railway" \
+      "🌐 Netlify" "✈️  Fly.io" "🐳 Docker/VPS" "🍒 Cherry/VPS")
+    case "$choice" in
+      *Cloudflare*) plat="cloudflare" ;;
+      *Vercel*)     plat="vercel"     ;;
+      *Render*)     plat="render"     ;;
+      *Railway*)    plat="railway"    ;;
+      *Netlify*)    plat="netlify"    ;;
+      *Fly*)        plat="fly"        ;;
+      *)            plat="docker"     ;;
+    esac
+    json_set "$DEPLOY_CFG" "platform" "$plat"
+  fi
+
+  step "Deploying to ${plat}…"
+
+  local deployed_url=""
+  case "$plat" in
+    cloudflare)
+      has wrangler || { err "wrangler not found. Run: npm install -g wrangler && wrangler login"; exit 1; }
+      wrangler deploy --env production
+      deployed_url=$(wrangler deploy --dry-run 2>&1 | grep -o 'https://[^"]*\.workers\.dev' | head -1 || echo "")
+      ;;
+    vercel)
+      has vercel || { err "vercel not found. Run: npm install -g vercel && vercel login"; exit 1; }
+      deployed_url=$(vercel --prod --yes 2>&1 | grep -o 'https://[^ ]*\.vercel\.app' | head -1 || echo "")
+      ;;
+    railway)
+      has railway || { err "railway not found. Run: npm install -g @railway/cli && railway login"; exit 1; }
+      railway up --detach
+      deployed_url=$(railway status 2>/dev/null | grep -o 'https://[^ ]*\.railway\.app' | head -1 || echo "")
+      ;;
+    netlify)
+      has netlify || { err "netlify not found. Run: npm install -g netlify-cli && netlify login"; exit 1; }
+      netlify deploy --prod
+      deployed_url=$(netlify status 2>/dev/null | grep -o 'https://[^ ]*\.netlify\.app' | head -1 || echo "")
+      ;;
+    fly)
+      has flyctl || { err "flyctl not found. Run: curl -L https://fly.io/install.sh | sh"; exit 1; }
+      flyctl deploy
+      deployed_url=$(flyctl status 2>/dev/null | grep -o 'https://[^ ]*\.fly\.dev' | head -1 || echo "")
+      ;;
+    render)
+      info "Render deploys automatically on git push. Connect your repo at render.com"
+      info "Push changes: git add . && git commit -m 'deploy' && git push"
+      return 0
+      ;;
+    docker|vps|cherry*)
+      if has docker; then
+        step "Building Docker image…"
+        docker build -t "streamx-addon:latest" .
+        ok "Docker image built"
+        echo
+        info "To run locally:     docker compose up -d"
+        info "To push to Docker Hub:"
+        echo -e "  ${C}docker tag streamx-addon:latest YOUR_USER/streamx-addon:latest${NC}"
+        echo -e "  ${C}docker push YOUR_USER/streamx-addon:latest${NC}"
+        info "To deploy on VPS (SSH into server):"
+        echo -e "  ${C}docker pull YOUR_USER/streamx-addon:latest${NC}"
+        echo -e "  ${C}docker compose up -d --force-recreate${NC}"
+      else
+        warn "Docker not found. Install Docker first."
+      fi
+      return 0
+      ;;
+  esac
+
+  if [[ -n "$deployed_url" ]]; then
+    local manifest_url="${deployed_url%/}/manifest.json"
+    json_set "$DEPLOY_CFG" "deployedUrl" "$manifest_url"
+    ok "Deployed: ${W}${deployed_url}${NC}"
+    echo
+    _verify_live "$manifest_url"
+    _print_install_guide "$manifest_url"
+  else
+    warn "Could not detect deployed URL. Check your platform dashboard."
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  COMMAND: test
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_test() {
+  require_any
+  local port="${1:-7070}" runner
+  runner=$(js_runner)
+
+  step "Testing addon on port ${port}"
+
+  # Start server in background
+  PORT="$port" $runner src/index.js &
+  local pid=$!
+  trap "kill $pid 2>/dev/null; exit" INT TERM EXIT
+  sleep 2
+
+  local base="http://127.0.0.1:${port}"
+  local passed=0 failed=0
+
+  _test_endpoint "manifest.json"       "GET" "$base/manifest.json"         "id"       && passed=$((passed+1)) || failed=$((failed+1))
+  _test_endpoint "CORS headers"        "OPT" "$base/manifest.json"         "cors"     && passed=$((passed+1)) || failed=$((failed+1))
+  _test_endpoint "stream (Godfather)"  "GET" "$base/stream/movie/tt0068646.json" "streams" && passed=$((passed+1)) || failed=$((failed+1))
+  _test_endpoint "health check"        "GET" "$base/health"                "status"   && passed=$((passed+1)) || failed=$((failed+1))
+
+  kill $pid 2>/dev/null
+  trap - INT TERM EXIT
+
+  echo
+  if [[ $failed -eq 0 ]]; then
+    ok "${G}All ${passed} tests passed!${NC}  Ready to deploy: ${C}streamx-deploy deploy${NC}"
+  else
+    warn "${passed} passed, ${R}${failed} failed${NC}.  Fix issues before deploying."
+    return 1
+  fi
+}
+
+_test_endpoint() {
+  local label="$1" method="$2" url="$3" key="$4"
+  local resp status
+  if [[ "$method" == "OPT" ]]; then
+    resp=$(curl -sI -X OPTIONS "$url" 2>/dev/null)
+    echo "$resp" | grep -qi "access-control" && { ok "$label"; return 0; } || { err "$label (missing CORS)"; return 1; }
+  else
+    resp=$(curl -sf "$url" 2>/dev/null)
+    [[ -n "$resp" ]] && echo "$resp" | grep -q "\"$key\"" && { ok "$label"; return 0; } || { err "$label"; return 1; }
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  COMMAND: validate
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_validate() {
+  local url="$1"
+  [[ -z "$url" ]] && {
+    url=$(json_get "$DEPLOY_CFG" "deployedUrl" 2>/dev/null || echo "")
+    [[ -z "$url" ]] && { err "Provide URL: streamx-deploy validate https://addon.vercel.app/manifest.json"; exit 1; }
+  }
+  [[ "$url" != *manifest.json ]] && url="${url%/}/manifest.json"
+
+  step "Validating: ${url}"
+
+  local manifest
+  manifest=$(curl -sf --max-time 10 "$url") || { err "Cannot reach $url"; exit 1; }
+
+  _check "manifest reachable"  true
+  echo "$manifest" | grep -q '"id"'       && ok "has id"       || { err "missing id";       }
+  echo "$manifest" | grep -q '"name"'     && ok "has name"     || { err "missing name";     }
+  echo "$manifest" | grep -q '"version"'  && ok "has version"  || { err "missing version";  }
+  echo "$manifest" | grep -q '"resources"' && ok "has resources" || { err "missing resources"; }
+
+  # ID format
+  local id
+  id=$(echo "$manifest" | grep -o '"id"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"/\1/')
+  echo "$id" | grep -qE '^community\.[a-z0-9_-]+\.[a-z0-9_-]+$' \
+    && ok "id format valid: ${id}" \
+    || warn "id '${id}' should match community.author.name"
+
+  # Stream test
+  local base="${url%/manifest.json}"
+  local streams
+  streams=$(curl -sf --max-time 12 "${base}/stream/movie/tt0068646.json" 2>/dev/null) || streams='{"streams":[]}'
+  echo "$streams" | grep -q '"streams"' && ok "stream endpoint valid" || err "stream endpoint invalid"
+
+  # CORS
+  curl -sI -X OPTIONS "$url" 2>/dev/null | grep -qi "access-control" \
+    && ok "CORS headers present" || warn "CORS headers missing"
+
+  echo
+  ok "${G}Validation complete${NC}"
+  _print_install_guide "$url"
+}
+
+_check() { ok "$1"; }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  COMMAND: register
+#  Submit to StreamX community registry
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_register() {
+  local url
+  url=$(json_get "$DEPLOY_CFG" "deployedUrl" 2>/dev/null || echo "")
+  [[ -z "$url" ]] && {
+    url=$(prompt "Deployed manifest URL")
+    [[ "$url" != *manifest.json ]] && url="${url%/}/manifest.json"
+  }
+
+  step "Fetching addon manifest…"
+  local manifest
+  manifest=$(curl -sf --max-time 10 "$url") || { err "Cannot reach $url"; exit 1; }
+
+  local id name version desc logo types resources
+  id=$(echo "$manifest"       | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('id',''))")
+  name=$(echo "$manifest"     | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('name',''))")
+  version=$(echo "$manifest"  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('version','1.0.0'))")
+  desc=$(echo "$manifest"     | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('description',''))")
+  logo=$(echo "$manifest"     | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('logo',''))")
+  types=$(echo "$manifest"    | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps(d.get('types',[])))")
+  resources=$(echo "$manifest"| python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps([r if isinstance(r,str) else r.get('name','') for r in d.get('resources',[])]))")
+
+  local nsfw
+  nsfw=$(prompt "Is this addon NSFW? (adult content)" "no")
+  [[ "$nsfw" =~ ^[Yy] ]] && nsfw_val="true" || nsfw_val="false"
+
+  # Build registry entry JSON
+  local entry
+  entry=$(python3 << PYEOF
+import json
+entry = {
+  "manifest": {
+    "id": "${id}",
+    "version": "${version}",
+    "name": "${name}",
+    "description": "${desc}",
+    "logo": "${logo}",
+    "types": ${types},
+    "resources": ${resources},
+    "idPrefixes": ["tt"],
+    "catalogs": []
+  },
+  "transportUrl": "${url}",
+  "kind": "HTTP_ENDPOINT",
+  "flags": { "official": False, "verified": False, "nsfw": ${nsfw_val} }
+}
+print(json.dumps(entry, indent=2))
+PYEOF
+)
+
+  step "Your registry entry:"
+  echo -e "${C}${entry}${NC}"
+  echo
+
+  # Open GitHub PR URL
+  local encoded_body
+  encoded_body=$(python3 -c "import urllib.parse; print(urllib.parse.quote('## Addon Submission\n\n\`\`\`json\n${entry}\n\`\`\`\n\nI confirm this addon will remain 24/7 available.'))")
+  local pr_url="${REGISTRY_REPO}/compare/main...main?quick_pull=1&title=$(python3 -c "import urllib.parse; print(urllib.parse.quote('[Addon] ${name}'))")&body=${encoded_body}"
+
+  step "Submit to StreamX Registry:"
+  echo -e "  1. Fork: ${C}${REGISTRY_REPO}${NC}"
+  echo -e "  2. Add the JSON above to ${W}registry.json${NC}"
+  echo -e "  3. Open a Pull Request — the bot will auto-validate\n"
+  echo -e "  Or open this pre-filled PR link:\n  ${DIM}${pr_url}${NC}"
+  echo
+  info "After merge, your addon appears on the catalog website within minutes."
+
+  # Try to open browser
+  has xdg-open && xdg-open "$pr_url" 2>/dev/null || \
+  has open     && open "$pr_url" 2>/dev/null || \
+  info "Copy the URL above and open in your browser."
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  COMMAND: platforms
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_platforms() {
+  echo -e "\n${BOLD}Supported Platforms${NC}\n"
+  local available
+  available=$(detect_platforms)
+
+  _platform_row() {
+    local key="$1" name="$2" cost="$3" notes="$4"
+    local cli_status
+    echo "$available" | grep -q "$key" \
+      && cli_status="${G}✓ CLI installed${NC}" \
+      || cli_status="${DIM}CLI not installed${NC}"
+    printf "  ${C}%-12s${NC} ${W}%-20s${NC} %-22s %b\n" "$key" "$name" "$cost" "$cli_status"
+  }
+
+  _platform_row "cloudflare" "Cloudflare Workers" "Free (100k req/day)"  ""
+  _platform_row "vercel"     "Vercel"             "Free (100GB/month)"   ""
+  _platform_row "netlify"    "Netlify Functions"  "Free (125k req/month)" ""
+  _platform_row "render"     "Render"             "Free (sleeps 15min)"  ""
+  _platform_row "fly"        "Fly.io"             "Free tier available"  ""
+  _platform_row "railway"    "Railway"            "\$5 credit/month"     ""
+  _platform_row "docker"     "Docker / VPS"       "Your server cost"     ""
+  _platform_row "vps"        "Any VPS (SSH)"      "Your server cost"     ""
+  echo
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  COMMAND: update
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_update() {
+  step "Updating streamx-deploy…"
+  local install_path
+  install_path=$(which streamx-deploy 2>/dev/null || echo "/usr/local/bin/streamx-deploy")
+  curl -sSL "https://aeoncorex-lab.github.io/streamx-deploy/streamx-deploy" -o "$install_path"
+  chmod +x "$install_path"
+  ok "Updated to latest version"
+}
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+_verify_live() {
+  local url="$1"
+  info "Verifying live endpoint…"
+  sleep 3
+  curl -sf --max-time 10 "$url" &>/dev/null \
+    && ok "Live and responding" \
+    || warn "Not responding yet. May take up to 30 seconds to start."
+}
+
+_print_install_guide() {
+  local url="$1"
+  echo -e "\n${BOLD}Install in StreamX:${NC}"
+  echo -e "  ${Y}Settings → Addons → 🔗 → paste:${NC}"
+  echo -e "  ${C}${url}${NC}"
+  echo
+  echo -e "  ${DIM}Deeplink: streamx://install-addon?url=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${url}'))" 2>/dev/null || echo "${url}")${NC}"
+  echo
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Main dispatcher
+# ═══════════════════════════════════════════════════════════════════════════════
+main() {
+  local cmd="${1:-help}"
+  shift 2>/dev/null || true
+
+  case "$cmd" in
+    new|init|create)  cmd_new        "$@" ;;
+    deploy|push)      cmd_deploy     "$@" ;;
+    test|dev)         cmd_test       "$@" ;;
+    validate|check)   cmd_validate   "$@" ;;
+    register|publish) cmd_register   "$@" ;;
+    platforms|list)   cmd_platforms       ;;
+    update|upgrade)   cmd_update          ;;
+    version|-v|--version) echo "streamx-deploy v${VERSION}" ;;
+    help|-h|--help|*)
+      banner
+      echo -e "${BOLD}Usage:${NC}  streamx-deploy <command>\n"
+      echo -e "  ${C}new${NC}              Scaffold new addon project (interactive)"
+      echo -e "  ${C}deploy${NC}           Deploy to your chosen platform"
+      echo -e "  ${C}test${NC}             Test endpoints locally"
+      echo -e "  ${C}validate${NC} [url]   Validate a live addon URL"
+      echo -e "  ${C}register${NC}         Submit to StreamX community registry"
+      echo -e "  ${C}platforms${NC}        Show supported platforms"
+      echo -e "  ${C}update${NC}           Update this tool\n"
+      echo -e "${DIM}Install: curl -sSL https://aeoncorex-lab.github.io/streamx-deploy/install.sh | bash${NC}\n"
+      ;;
+  esac
+}
+
+main "$@"
