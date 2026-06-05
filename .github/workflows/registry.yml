@@ -1,0 +1,98 @@
+name: Registry Health Check & Auto-Registration
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # every 6 hours
+  workflow_dispatch:
+    inputs:
+      force_check:
+        description: 'Force re-check all addons'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+  issues:   write
+  pull-requests: write
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run health check
+        env:
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DISCORD_WEBHOOK:   ${{ secrets.DISCORD_WEBHOOK }}
+        run: node scripts/health-check.js
+        continue-on-error: true
+
+      - name: Commit updated files
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'chore(health): update strikes + registry [skip ci]'
+          file_pattern:   'registry.json strikes.json graveyard.json'
+          commit_user_name:  'StreamX Registry Bot'
+          commit_user_email: 'bot@streamx.app'
+
+      - name: Upload health report
+        uses: actions/upload-artifact@v4
+        with:
+          name:            health-report-${{ github.run_number }}
+          path:            health-report.json
+          retention-days:  30
+
+  # ── Auto-validate incoming PRs ─────────────────────────────────────────────
+  validate-pr:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Extract new/changed addon from PR
+        id: extract
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          node -e "
+            const base = require('./registry.json');
+            let baseReg = [];
+            try {
+              const {execSync} = require('child_process');
+              baseReg = JSON.parse(execSync('git show origin/${{ github.base_ref }}:registry.json').toString());
+            } catch {}
+            const baseIds = new Set(baseReg.map(a => a.manifest?.id));
+            const newAddons = base.filter(a => !baseIds.has(a.manifest?.id));
+            if (newAddons.length === 0) { console.log('NO_CHANGE'); process.exit(0); }
+            const fs = require('fs');
+            fs.writeFileSync('/tmp/new_addon.json', JSON.stringify(newAddons[0]));
+            console.log(JSON.stringify(newAddons[0]));
+          " > /dev/null
+
+          if [ -f /tmp/new_addon.json ]; then
+            echo "addon=$(cat /tmp/new_addon.json)" >> $GITHUB_OUTPUT
+          else
+            echo "skip=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate addon
+        if: steps.extract.outputs.skip != 'true'
+        env:
+          NEW_ADDON_JSON:    ${{ steps.extract.outputs.addon }}
+          GITHUB_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER:         ${{ github.event.number }}
+        run: node scripts/validate-addon.js
